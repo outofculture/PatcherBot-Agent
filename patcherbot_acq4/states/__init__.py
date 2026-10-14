@@ -21,6 +21,37 @@ UM = 1e-6
 MBAR = 100.0
 MOHM = 1e6
 MODES = ('Manual', 'Classic', 'Adaptive', 'Agent', 'Training')
+# Training rows: one rig-recorder row per DAQ acquisition, polled every 42 ms.
+TRAINING_ROW_PERIOD_S = 0.042
+
+
+def frame_pixels(frame):
+    """Row-major image array; ACQ4 Frame.data() is indexed [x, y]."""
+    data = frame.data()
+    return np.ascontiguousarray(np.swapaxes(data, 0, 1))
+
+
+def resistance_features(history, input_width, slope_window):
+    """Online form of SimpleDatasetBuilder's resistance_input/resistance_slope.
+
+    *history* holds the current row last. resistance_input is the *prior* rows,
+    oldest first, zero-padded on the left. resistance_slope is the mean of the
+    last min(50, slope_window) row-to-row differences, 0 for rows 0-3; units
+    are MΩ per row, not per second.
+    """
+    values = list(history)
+    prior = values[:-1][-input_width:] if input_width else []
+    features = {}
+    if input_width:
+        features['resistance_input'] = np.array(
+            [0.0] * (input_width - len(prior)) + prior, dtype=np.float32)
+    row = len(values) - 1
+    slope = 0.0
+    if row >= 4:
+        n = min(min(50, max(1, int(slope_window))), row)
+        slope = float(np.mean(np.diff(values[-(n + 1):])))
+    features['resistance_slope'] = np.float32(slope)
+    return features
 
 
 def _number(value, label):
@@ -65,7 +96,8 @@ class PhaseContext:
         self.recorder = getattr(job.dev, 'recorder', None)
         self.last_frame_time = None
         self.last_observed_at = None
-        self._resistance_window = None
+        # Policy rows of this job: enough for a 50-difference slope or the input window.
+        self._resistance_history = deque(maxlen=51)
 
 
     def preflight(self):
@@ -80,11 +112,15 @@ class PhaseContext:
             if self.policy is None:
                 raise RuntimeError(f'{self.job.stateName} Agent needs dev.policy with a loaded checkpoint')
             self.policy.require(self.job.policy_phase)
+            # Loads the checkpoint now: a broken policy must fail before any actuation.
+            required = set(self.policy.required_obs_keys(self.job.policy_phase))
+            self.policy.reset(self.job.policy_phase)  # fresh LSTM/chunk state per job
             if self.job.stateName in ('seal', 'break in') and getattr(self.dev, 'continuous', None) is None:
                 raise RuntimeError(f'{self.job.stateName} Agent needs dev.continuous, not finite test pulses')
-            if self.detector is None or self.camera is None:
-                raise RuntimeError(f'{self.job.stateName} Agent needs dev.detector and dev.camera')
-            self.detector.require('find_pipette')
+            if required & {'camera_image', 'pipette_positions'}:
+                if self.detector is None or self.camera is None:
+                    raise RuntimeError(f'{self.job.stateName} Agent needs dev.detector and dev.camera')
+                self.detector.require('find_pipette')
         if mode == 'Adaptive' and self.job.stateName in ('find pipette', 'approach', 'cell detect'):
             if self.detector is None:
                 raise RuntimeError(f'{self.job.stateName} Adaptive needs dev.detector with loaded checkpoints')
@@ -105,6 +141,10 @@ class PhaseContext:
             scope = getattr(self.camera, 'scopeDev', None)
             if scope is None or not callable(getattr(scope, 'setFocusDepth', None)):
                 raise RuntimeError(f'Adaptive {self.job.stateName} needs calibrated camera.scopeDev focus control')
+            if not self.detector.has_z_confidence:
+                # PatcherBot's contact/spear gate needs Z confidence >= 0.5; it could never pass.
+                raise RuntimeError(f'Adaptive {self.job.stateName} needs a PipetteDetector4 checkpoint '
+                                   'with the Z-confidence head')
         if self.job.stateName in ('find pipette', 'approach', 'cell detect') and self.camera is None and mode != 'Manual':
             raise RuntimeError(f'{self.job.stateName} requires dev.camera')
 
@@ -179,15 +219,17 @@ class PhaseContext:
     def detect_tip(self, frame):
         if self.detector is None:
             raise RuntimeError('Pipette detector checkpoint is unavailable')
-        result = self.detector.detect_pipette_details(frame.data())
+        result = self.detector.detect_pipette_details(frame_pixels(frame))
         if result is None:
             raise RuntimeError('Pipette not detected in fresh frame')
         xy = np.asarray(result['xy'], dtype=float)
         if xy.shape != (2,) or not np.isfinite(xy).all():
             raise ValueError('Invalid detector tip pixel coordinates')
+        # z_confidence is None for checkpoints without the optional Z-confidence head.
+        z_conf = result['z_confidence']
         return {'xy': xy, 'z_um': _number(result['z_um'], 'tip defocus'),
                 'box_confidence': _number(result['box_confidence'], 'tip confidence'),
-                'z_confidence': _number(result['z_confidence'], 'focus confidence')}
+                'z_confidence': None if z_conf is None else _number(z_conf, 'focus confidence')}
 
     def image_delta_um(self, frame, dx, dy):
         """Map image displacement to global tip motion using the acquired frame calibration."""
@@ -250,7 +292,7 @@ class PhaseContext:
         sample = {k: v for k, v in observation.items() if k not in ('frame', 'test_pulse')}
         frame = observation.get('frame')
         if frame is not None:
-            sample['camera_image'] = self.detector.prepare_image(frame.data())
+            sample['camera_image'] = self.detector.prepare_image(frame_pixels(frame))
         tip = observation.get('tip')
         if tip is not None:
             sample.update(pipette_image_xy=tip['xy'], pipette_defocus_um=tip['z_um'])
@@ -263,24 +305,20 @@ class PhaseContext:
             sample['pressure_atm_state'] = self.pressure.getSource() == 'atmosphere'
         resistance = sample.get('resistance')
         if resistance is not None and np.isfinite(resistance):
-            if self._resistance_window is None:
-                width = self.policy.observation_input_width(self.job.policy_phase,
-                                                              'resistance_input', default_width=15)
-                if not isinstance(width, int) or width <= 0:
-                    raise ValueError(f'Invalid policy resistance_input width: {width!r}')
-                self._resistance_window = deque(maxlen=width)
-            self._resistance_window.append(float(resistance))
-            width = self._resistance_window.maxlen
-            sample['resistance_input'] = np.array(
-                [0.0] * (width - len(self._resistance_window)) + list(self._resistance_window),
-                dtype=np.float32)
+            # One policy call is one training row.
+            width = self.policy.observation_input_width(self.job.policy_phase, 'resistance_input')
+            if not isinstance(width, int) or width < 0 or width > self._resistance_history.maxlen - 1:
+                raise ValueError(f'Unsupported policy resistance_input width: {width!r}')
+            self._resistance_history.append(float(resistance))
+            sample.update(resistance_features(
+                self._resistance_history, width, self.job.config.get('agentSlopeWindow', 20)))
         return self.policy.run_inference(self.job.policy_phase, sample, goal=goal)
 
     def record(self, observation, calculations, action):
         if self.recorder is not None:
             source = dict(observation)
             if frame := source.get('frame'):
-                source['camera_image'] = frame.data()
+                source['camera_image'] = frame_pixels(frame)
             details = {k: v for k, v in calculations.items() if k != 'observation'}
             self.recorder.record(self.job.stateName, _recordable(source),
                                  _recordable(details), _recordable(action))
@@ -377,9 +415,12 @@ class FindPipetteState(PatcherBotPhaseState):
     def run(self):
         if self.config['mode'] == 'Manual':
             return self.manual()
+        electrical_keys = {'resistance', 'resistance_input', 'resistance_slope'}
+        needs_electrical = self.config['mode'] == 'Agent' and bool(
+            electrical_keys & set(self.ctx.policy.required_obs_keys(self.policy_phase)))
         while True:
             check_stop()
-            electrical = self.ctx.pulse() if self.config['mode'] == 'Agent' else {}
+            electrical = self.ctx.pulse() if needs_electrical else {}
             frame = self.ctx.image()
             try:
                 tip = self.ctx.detect_tip(frame)
@@ -393,7 +434,7 @@ class FindPipetteState(PatcherBotPhaseState):
 
     def calculate(self, obs, state):
         frame, tip = obs['frame'], obs['tip']
-        width, height = frame.data().shape[:2]
+        width, height = frame.data().shape[:2]  # ACQ4 frames are [x, y]
         target = np.array([width / 2, height / 2])
         error = target - tip['xy']
         delta = self.ctx.image_delta_um(frame, *error)
@@ -411,7 +452,9 @@ class FindPipetteState(PatcherBotPhaseState):
             return {'kind': 'wait'}
         if self.config['mode'] != 'Agent':
             return {'kind': 'move', 'delta_um': calc['error_um']}
-        values = np.asarray(self.ctx.infer(calc['observation'], goal=calc['target_px']), dtype=object).reshape(-1)
+        # Live PatcherBot goal: native-pixel tip position with zero defocus.
+        goal = np.array([*calc['target_px'], 0.0])
+        values = np.asarray(self.ctx.infer(calc['observation'], goal=goal), dtype=object).reshape(-1)
         if values.size not in (2, 3):
             raise ValueError('find_pipette policy needs 2 or 3 coordinates')
         xy = np.asarray(values[:2], dtype=float)
@@ -493,7 +536,7 @@ class ApproachCellState(PatcherBotPhaseState):
             if not (low - 5 * UM <= focus <= high + 5 * UM):
                 raise RuntimeError('Adaptive approach exceeded camera focus search bounds')
             tip = self.ctx.detect_tip(frame)
-            cells = self.ctx.detector.detect_cells(frame.data())
+            cells = self.ctx.detector.detect_cells(frame_pixels(frame))
             obs = {'frame': frame, 'focus': focus, 'tip': tip, 'cells': cells,
                    'position_um': self.ctx.position_um(), 'target_um': target / UM}
             calculations = self.calculate_adaptive(obs, state)
@@ -514,7 +557,7 @@ class ApproachCellState(PatcherBotPhaseState):
         tip = obs['tip']
         return {'observation': obs, 'cell': detected, 'cell_shift_px': cell_shift,
                 'tip_ready': tip['box_confidence'] >= self.config['tipConfidence']
-                and tip['z_confidence'] >= 0.5,
+                and (tip['z_confidence'] or 0) >= 0.5,
                 'focus_z_error_um': abs(obs['focus'] - state['tip_z']) / UM,
                 'tip_defocus_um': abs(tip['z_um'])}
 
@@ -685,7 +728,7 @@ class HuntCellState(PatcherBotPhaseState):
                 frame = self.ctx.image()
                 obs['frame'] = frame
                 obs['tip'] = self.ctx.detect_tip(frame)
-                obs['cells'] = self.ctx.detector.detect_cells(frame.data())
+                obs['cells'] = self.ctx.detector.detect_cells(frame_pixels(frame))
             action = self.cycle(obs, state)
             if action['kind'] == 'complete':
                 return {'state': 'seal'}
@@ -703,7 +746,7 @@ class HuntCellState(PatcherBotPhaseState):
                 raise TimeoutError('Adaptive hunt exceeded 60 second deadline')
             frame = obs['frame']
             tip = obs['tip']
-            if tip['box_confidence'] < self.config['tipConfidence'] or tip['z_confidence'] < 0.5:
+            if tip['box_confidence'] < self.config['tipConfidence'] or (tip['z_confidence'] or 0) < 0.5:
                 raise RuntimeError('Adaptive hunt lost fresh confident tip/depth detection')
             target = np.asarray(frame.mapFromGlobalToFrame(self.ctx.pip.targetPosition()), dtype=float)[:2]
             cells = [np.asarray(cell, dtype=float) for cell in obs['cells']]
@@ -779,6 +822,12 @@ class GigasealState(PatcherBotPhaseState):
         'deadlineS': {'type': 'float', 'default': 150.0, 'suffix': 's'},
         'rampLimitMbar': {'type': 'float', 'default': -30.0, 'suffix': 'mbar'},
         'holdingV': {'type': 'float', 'default': -0.07, 'suffix': 'V'},
+        # Agent: one policy call per training row (rig-recorder rows, ~42 ms apart).
+        'agentRowPeriodS': {'type': 'float', 'default': TRAINING_ROW_PERIOD_S, 'suffix': 's'},
+        'agentSlopeWindow': {'type': 'int', 'default': 20},
+        # Policy dim 0 is applied pressure in mbar, 0 meaning ATM in training data.
+        'agentVentAboveMbar': {'type': 'float', 'default': -2.5, 'suffix': 'mbar'},
+        'agentPressureStepMbar': {'type': 'float', 'default': 5.0, 'suffix': 'mbar'},
     }
     _parameterDefaultOverrides = {**PatcherBotPhaseState._parameterDefaultOverrides,
                                   'initialClampMode': 'VC', 'initialTestPulseEnable': True}
@@ -801,19 +850,43 @@ class GigasealState(PatcherBotPhaseState):
         sleep(3)
         if self.config['mode'] in ('Classic', 'Adaptive'):
             self.ctx.pressure_mbar(-5)
+        if self.config['mode'] == 'Agent':
+            return self._run_agent(state)
         while True:
             obs = self.ctx.window(5, interval)
-            if self.config['mode'] == 'Agent':
-                obs['frame'] = self.ctx.image()
-                obs['tip'] = self.ctx.detect_tip(obs['frame'])
-                obs['position_um'] = self.ctx.position_um()
-                obs['observations_since_last_action'] = state['observations_since_last_action']
             action = self.cycle(obs, state)
             if action['kind'] == 'complete':
                 return {'state': 'break in'}
 
+    def _run_agent(self, state):
+        period = self.config['agentRowPeriodS']
+        if not period > 0:
+            raise ValueError('agentRowPeriodS must be positive')
+        now = time.monotonic()
+        state.update(progress_reference=state['previous'], progress_reference_at=now,
+                     above_target_since=None)
+        next_row = now
+        while True:
+            check_stop()
+            obs = self.ctx.pulse()  # one fresh acquisition is one policy row
+            action = self.cycle(obs, state)
+            if action['kind'] == 'complete':
+                return {'state': 'break in'}
+            next_row = max(next_row + period, time.monotonic())
+            sleep(next_row - time.monotonic())
+
     def calculate(self, obs, state):
         resistance = obs['resistance']
+        if self.config.get('mode') == 'Agent':
+            # Progress over the Classic window span (5 samples), not per 42 ms row.
+            now = time.monotonic()
+            span = 5 * self.config['measurementIntervalS']
+            delta = resistance - state['progress_reference']
+            if now - state['progress_reference_at'] >= span:
+                if delta >= self.config['minDeltaMohm']:
+                    state['last_progress'] = now
+                state.update(progress_reference=resistance, progress_reference_at=now)
+            return {'observation': obs, 'resistance_mohm': resistance, 'delta_mohm': delta}
         delta = resistance - state['previous']
         if delta >= self.config['minDeltaMohm']:
             state['last_progress'] = time.monotonic()
@@ -825,11 +898,20 @@ class GigasealState(PatcherBotPhaseState):
         if time.monotonic() - state['last_progress'] >= self.config['deadlineS']:
             raise TimeoutError('Seal resistance failed to improve before deadline')
         resistance = calc['resistance_mohm']
-        state['success'] = state['success'] + 1 if resistance >= self.config['targetMohm'] else 0
-        if state['success'] >= 3:
-            return {'kind': 'complete'}
-        holding = resistance >= self.config['targetMohm'] / self.config['holdSwitch'] and not state['holding_switched']
         mode = self.config['mode']
+        if mode == 'Agent':
+            # Same sustained span as three consecutive 5-sample Classic windows.
+            if resistance >= self.config['targetMohm']:
+                since = state['above_target_since'] = state['above_target_since'] or time.monotonic()
+                if time.monotonic() - since >= 15 * self.config['measurementIntervalS']:
+                    return {'kind': 'complete'}
+            else:
+                state['above_target_since'] = None
+        else:
+            state['success'] = state['success'] + 1 if resistance >= self.config['targetMohm'] else 0
+            if state['success'] >= 3:
+                return {'kind': 'complete'}
+        holding = resistance >= self.config['targetMohm'] / self.config['holdSwitch'] and not state['holding_switched']
         if mode in ('Training', 'Manual'):
             return {'kind': 'wait', 'holding': False}
         if state['release_reference'] is not None and mode in ('Classic', 'Adaptive'):
@@ -842,11 +924,17 @@ class GigasealState(PatcherBotPhaseState):
                     'release_difference_mohm': difference}
         if mode == 'Agent':
             raw = np.asarray(self.ctx.infer(calc['observation']), dtype=float).reshape(-1)
-            if raw.size not in (1, 2) or not np.isfinite(raw).all():
-                raise ValueError('Invalid gigaseal policy pressure/ATM command')
-            atm = bool(raw[0] >= 0) if raw.size == 1 else bool(raw[1] >= 0.5)
-            pressure = state['pressure'] if raw.size == 1 and atm else float(np.clip(raw[0], self.config['rampLimitMbar'], -5))
-            return {'kind': 'pressure', 'pressure_mbar': pressure, 'atm': atm, 'holding': holding}
+            if raw.size != 2 or not np.isfinite(raw).all():
+                raise ValueError('gigaseal policy must return [applied_pressure_mbar, '
+                                 f'observations_until_next_action], got {raw!r}')
+            atm = bool(raw[0] > self.config['agentVentAboveMbar'])
+            step = self.config['agentPressureStepMbar']
+            # Never positive pressure on a seal; suction is limited to rampLimitMbar.
+            pressure = state['pressure'] if atm else float(
+                np.clip(np.round(raw[0] / step) * step, self.config['rampLimitMbar'], -5))
+            return {'kind': 'pressure', 'pressure_mbar': pressure, 'atm': atm, 'holding': holding,
+                    'policy_applied_pressure_mbar': float(raw[0]),
+                    'policy_observations_until_next_action': float(raw[1])}
         rate = calc['rate_mohm_s']
         pressure = state['pressure']
         speed = 1
@@ -867,30 +955,33 @@ class GigasealState(PatcherBotPhaseState):
             check_stop()
             if self.ctx.last_observed_at is None or time.monotonic() - self.ctx.last_observed_at > 2:
                 raise RuntimeError('Stale Agent seal observation; refusing pressure update')
+            if action.get('holding'):
+                self.ctx.clamp.setHolding(mode='VC', value=self.config['holdingV'])
+                state['holding_switched'] = True
+            applied = (action['pressure_mbar'], action['atm'])
+            if applied == state['last_agent_action']:
+                state['observations_since_last_action'] += 1
+                return
+            if action['atm']:
+                # Keep the regulator setpoint; state cleanup winds it down to zero.
+                self.ctx.pressure.setPressure(source='atmosphere')
+            else:
+                self.ctx.pressure_mbar(action['pressure_mbar'])
+            state.update(last_agent_action=applied, observations_since_last_action=0,
+                         pressure=action['pressure_mbar'])
+            return
         if action.get('holding'):
             self.ctx.clamp.setHolding(mode='VC', value=self.config['holdingV'])
             state['holding_switched'] = True
         if action['kind'] == 'pressure':
             if action['atm']:
-                if self.config['mode'] == 'Agent':
-                    # Vent the pipette without losing the requested regulator
-                    # setpoint; the final state cleanup winds it down to zero.
-                    self.ctx.pressure.setPressure(source='atmosphere')
-                    check_stop()
-                    self.ctx.pressure.setPressure(pressure=_number(action['pressure_mbar'], 'policy pressure') * MBAR)
-                else:
-                    self.ctx.vent()
+                self.ctx.vent()
                 if state['release_reference'] is None and self.config['mode'] in ('Classic', 'Adaptive'):
                     state['release_reference'] = state['previous']
                     sleep(5)
             else:
                 self.ctx.pressure_mbar(action['pressure_mbar'])
                 state['release_reference'] = None
-            if self.config['mode'] == 'Agent':
-                applied = (action['pressure_mbar'], action['atm'])
-                state['observations_since_last_action'] = (
-                    state['observations_since_last_action'] + 1 if applied == state['last_agent_action'] else 0)
-                state['last_agent_action'] = applied
             state['pressure'] = action['pressure_mbar']
             if action['pressure_mbar'] != state['prev_pressure']:
                 sleep(5 / action.get('speed', 1))

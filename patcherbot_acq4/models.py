@@ -101,6 +101,7 @@ class PatcherBotDetector:
             threshold=threshold,
             cuda_graph=cuda_graph,
         )
+        self.has_z_confidence = self._pipette.model.z_confidence_head is not None
         self._cell = None
         self.cell_checkpoint = None
         self.cell_sha256 = None
@@ -200,19 +201,36 @@ class PolicyRuntime:
                 )
             module = importlib.import_module(".model_runtime.policy", package=__package__)
             agent = getattr(module, _POLICY_CLASSES[phase])(model_path=checkpoint)
-            agent.allow_goal_placeholders = False
+            # Goal-conditioned policies take only goal-modality keys (find_pipette:
+            # pipette_positions); robomimic's goal dict must still carry every obs key,
+            # which the inferencer copies from the current observation.
+            agent.allow_goal_placeholders = agent.goal_required
             self._agents[phase] = agent
         return self._agents[phase]
 
     def run_inference(self, phase: str, observation: dict, *, goal=None) -> np.ndarray:
         with self._locks[phase]:
             agent = self._agent(phase)
-            if agent.goal_required and goal is None:
-                raise ValueError(f"{phase} policy requires an explicit goal")
+            if agent.goal_required:
+                if goal is None:
+                    raise ValueError(f"{phase} policy requires an explicit goal")
+                # Native-pixel [x, y, z_um] goal into the policy's 85 px image frame, as live PatcherBot.
+                goal = agent.prepare_coordinate_goal(
+                    np.asarray(goal, dtype=np.float32), observation.get("camera_image"))
             action = np.asarray(agent.inference(observation=observation, goal=goal, is_demo=False))
             if not np.isfinite(action).all():
                 raise ValueError(f"{phase} policy returned a nonfinite action")
             return action
+
+    def required_obs_keys(self, phase: str) -> tuple[str, ...]:
+        with self._locks[phase]:
+            return tuple(self._agent(phase).get_required_obs_keys())
+
+    def reset(self, phase: str):
+        """Start a new episode: clears LSTM hidden state and action-chunk history."""
+        with self._locks[phase]:
+            if phase in self._agents:
+                self._agents[phase]._started = False
 
     def observation_input_width(self, phase: str, key: str, default_width: int = 15) -> int:
         with self._locks[phase]:
@@ -224,8 +242,9 @@ class PolicyRuntime:
             return int(shape[-1]) if shape else default_width
 
     def start_attempt(self):
-        """Discard recurrent state and frame histories from the previous attempt."""
-        self._agents.clear()
+        """Reset recurrent state of every loaded policy without reloading weights."""
+        for phase in list(self._agents):
+            self.reset(phase)
 
     def provenance(self) -> dict:
         return {

@@ -79,9 +79,10 @@ class PatcherBotModule(Module):
             if self.pipette.policy is None:
                 raise FileNotFoundError(f"{state} Agent mode needs a configured policy checkpoint")
             self.pipette.policy.require(phase)
-            if self.pipette.detector is None:
-                raise FileNotFoundError(f"{state} Agent mode needs a PipetteDetector4 checkpoint")
-            self.pipette.detector.require("find_pipette")
+            if state == "find pipette":
+                if self.pipette.detector is None:
+                    raise FileNotFoundError(f"{state} Agent mode needs a PipetteDetector4 checkpoint")
+                self.pipette.detector.require("find_pipette")
             if state in ("seal", "break in") and not self.config.get("continuous"):
                 raise RuntimeError(f"{state} Agent mode requires continuous membrane acquisition")
         if chosen_mode == "Adaptive" and state in ("find pipette", "approach", "cell detect"):

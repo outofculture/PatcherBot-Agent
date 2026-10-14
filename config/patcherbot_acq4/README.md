@@ -27,7 +27,9 @@ Do not run an Autopatch protocol and a manual PatcherBot attempt concurrently.
 
 ## Model artifacts
 
-The tip/defocus inference code is carried from `../Neuron_Detection/code/Consumers/PipetteModel/PDModelFactory.py` (MIT; copy at `patcherbot_acq4/model_runtime/`). It implements a 384 px grayscale+Sobel U-Net/MobileNetV4 model, *not* ACQ4's ResNet pipette tracker. Specify its canonical checkpoint as `detector.pipetteCheckpoint`; Adaptive visual approach/hunt also requires `detector.cellCheckpoint` (and `cellEncoderConfig` for SegFormer). There is no checkpoint bundled. Missing or incompatible checkpoints raise before visual control begins.
+The tip/defocus inference code is carried from `../Neuron_Detection/code/Consumers/PipetteModel/PDModelFactory.py` (MIT; copy at `patcherbot_acq4/model_runtime/`). It implements a 384 px grayscale+Sobel U-Net/MobileNetV4 model, *not* ACQ4's ResNet pipette tracker. Specify its canonical checkpoint (`PipetteDetectorNetX.pt`) as `detector.pipetteCheckpoint`; Adaptive visual approach/hunt also requires `detector.cellCheckpoint` (and `cellEncoderConfig` for SegFormer) and a pipette checkpoint with the optional Z-confidence head, because PatcherBot's contact/spear gate needs Z confidence ≥ 0.5. `PipetteDetectorNetX.pt` has no such head, so Adaptive approach/hunt refuse to start with it. No checkpoint is bundled. Missing or incompatible checkpoints raise before visual control begins.
+
+ACQ4 `Frame.data()` is indexed `[x, y]`; the phases transpose it to the row-major images the detector and policies were trained on, so detected pixels map through the frame's own calibration.
 
 ACQ4/PCO cameras may supply raw `uint16` frames; PatcherBot's original camera
 normalizes to `uint8` before inference. Set `detector.inputRange: [lower, upper]`
@@ -36,7 +38,13 @@ still recorded separately. Without this explicit calibration, 16-bit
 visual/Agent inference fails rather than wrapping modulo 256. Check that
 lighting and this normalization match the detector/policy training domain.
 
-Agent modes require explicit PipetteFinder/GigaSealer/Burglar `.pth` checkpoints and the **custom robomimic fork** containing `robomimic.envs.env_patcher_online.EnvPatcherOnline`. Specify `policy.robomimicRoot` as the parent of the `robomimic/` package and `policy.checkpoints` by phase key `find_pipette`, `gigaseal`, `break_in`. PatcherBot's source hunt Agent has no movement policy action, and no approach Agent policy is deployed; both are blocked. Find-pipette velocity-prediction mode is blocked until a calibrated continuous-velocity stage API is available; displacement mode uses bounded ACQ4 planned moves. No weights, fork or matched labelled demonstration logs were in these checkouts. `rapiddweller/datamimic` is unrelated synthetic enterprise data software.
+Agent modes require explicit robomimic `.pth` checkpoints and the **custom robomimic fork** ([PBL-gatech/robomimic](https://github.com/PBL-gatech/robomimic)) containing `robomimic.envs.env_patcher_online.EnvPatcherOnline`. Clone it (do not `pip install` it: its pins downgrade `diffusers`, which the detector needs) and set `policy.robomimicRoot` to the clone; the ACQ4 environment additionally needs `termcolor` and `transformers` (see `setup.py` extras). Importing the fork loads a 1.6 GB CLIP text model from Hugging Face (`robomimic/utils/lang_utils.py`, cached under `$HF_HOME/clip`, default `~/tmp/clip`) even though no PatcherBot policy uses language, so the first load needs network access. Set `policy.checkpoints` by phase key:
+
+- `find_pipette` (`PF_LSTM_v0_720.pth`): 85×85 RGB camera image + `pipette_positions` = [tip x, tip y in the 85 px frame, defocus µm], goal-conditioned on a target `pipette_positions`; outputs a [Δx px, Δy px, Δz µm] step. The phase passes the frame-centre goal in native pixels and the runtime scales it as live PatcherBot does.
+- `gigaseal` (`GS_LSTM_v0_986.pth`): `resistance` (MΩ), `resistance_input` (the 30 *prior* rows, oldest first, zero-padded), `resistance_slope` (mean of the last 20 row-to-row differences, MΩ/row). One continuous-stream acquisition is one row, paced at `agentRowPeriodS` (default 42 ms, the rig recorder's polling period). Output is [applied pressure mbar, observations until next action] with 0 mbar meaning ATM in training: the phase vents above `agentVentAboveMbar` (−2.5), otherwise applies the value rounded to 5 mbar and clipped to [`rampLimitMbar`, −5]. It never applies positive pressure. The second output is recorded, not acted on.
+- `break_in`: no checkpoint has been provided.
+
+Each Agent phase job starts a fresh policy episode (LSTM state and action-chunk history). PatcherBot's source hunt Agent has no movement policy action, and no approach Agent policy is deployed; both are blocked. Find-pipette velocity-prediction mode is blocked until a calibrated continuous-velocity stage API is available; displacement mode uses bounded ACQ4 planned moves.
 
 ## Continuous membrane test
 

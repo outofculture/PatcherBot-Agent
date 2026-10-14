@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 
 from patcherbot_acq4.patchpipette import PatcherBotStateManager
-from patcherbot_acq4.states import BreakInState, GigasealState, HuntCellState, PhaseContext
+from patcherbot_acq4.states import (BreakInState, GigasealState, HuntCellState, PhaseContext,
+                                    resistance_features)
 from acq4.devices.PatchPipette.statemanager import PatchPipetteStateManager
 
 
@@ -60,6 +61,39 @@ def test_recorded_acq4_seal_trace_uses_mohm_boundary():
     assert calc['rate_mohm_s'] == pytest.approx(
         (resistance_mohm[index + 1] - resistance_mohm[index]) / (5 * .2))
     assert state['last_progress'] > 0
+
+
+def _builder_features(values, width, slope_window):
+    """Batch algorithms of experiments/SimpleDatasetBuilder.py (_compute_resistance_input_window,
+    _compute_resistance_slope; finite inputs) that produced the gigaseal training rows.
+    The builder itself cannot be imported here (it needs albumentations)."""
+    values = np.asarray(values, dtype=np.float64)
+    inputs = np.zeros((values.shape[0], width))
+    for row in range(values.shape[0]):
+        prior = values[max(0, row - width):row]
+        if prior.size:
+            inputs[row, -prior.size:] = prior
+    slopes = np.zeros(values.shape[0])
+    if values.shape[0] >= 5:
+        diffs = np.diff(values)
+        max_window = min(50, max(1, slope_window))
+        for end in range(3, diffs.shape[0]):
+            size = min(max_window, end + 1)
+            slopes[end + 1] = diffs[end + 1 - size:end + 1].mean()
+    return inputs, slopes
+
+
+def test_online_resistance_features_match_training_rows():
+    fixture = (Path(__file__).resolve().parents[2] / '..' / 'acq4' / 'acq4' / 'devices'
+               / 'PatchPipette' / 'tests' / 'data' / 'spontaneous_break_in_seal.npy')
+    trace = np.load(fixture)[:200, 1] / 1e6
+    inputs, slopes = _builder_features(trace, 30, 20)
+    history = deque(maxlen=51)
+    for row, value in enumerate(trace):
+        history.append(value)
+        online = resistance_features(history, 30, 20)
+        np.testing.assert_allclose(online['resistance_input'], inputs[row], rtol=1e-6)
+        assert online['resistance_slope'] == pytest.approx(slopes[row], rel=1e-5, abs=1e-6)
 
 
 def test_agent_preflight_rejects_missing_policy_before_actuation():

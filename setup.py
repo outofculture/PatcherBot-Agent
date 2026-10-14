@@ -48,6 +48,8 @@ setup(
             "opencv-python>=4.8", "Pillow>=9.5",
         ],
         "acq4-continuous": ["nidaqmx"],
+        # Imports of the PBL-gatech/robomimic clone set as policy.robomimicRoot (not pip-installed).
+        "acq4-policies": ["termcolor", "transformers>=4.56"],
         "acq4-pco": ["pco"],
     },
 )
