@@ -40,6 +40,17 @@ setup(
         "Programming Language :: Python :: 3",
     ],
     packages=find_packages(),
-    install_requires=parse_requirements("requirements_runtime.txt"),
+    install_requires=parse_requirements("requirements/requirements_runtime.txt"),
+    extras_require={
+        "acq4-detectors": [
+            "torch>=2.2", "torchvision>=0.17", "timm>=1.0.20",
+            "diffusers==0.40.0", "transformers>=4.56",
+            "opencv-python>=4.8", "Pillow>=9.5",
+        ],
+        "acq4-continuous": ["nidaqmx"],
+        # Imports of the PBL-gatech/robomimic clone set as policy.robomimicRoot (not pip-installed).
+        "acq4-policies": ["termcolor", "transformers>=4.56"],
+        "acq4-pco": ["pco"],
+    },
 )
 
